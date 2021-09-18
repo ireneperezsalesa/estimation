@@ -1,3 +1,5 @@
+# Estimation algorithm
+
 import numpy
 import torch
 import sys
@@ -31,7 +33,7 @@ def get_parser():
     )
     parser.add_argument(
         "--scheduling_method",
-        help="Scheduling policy: 'greedy', 'greedy2', 'mh', 'fixed'. "
+        help="Scheduling policy: 'mh', 'fixed'. "
     )
     parser.add_argument(
         "--schedule",
@@ -118,19 +120,19 @@ if __name__ == "__main__":
     if args.input.endswith('zip'):
         zip_file = zipfile.ZipFile(args.input)
         files_in_archive = zip_file.namelist()
-        assert (len(files_in_archive) == 1)  # make sure there is only one text file in the archive
+        assert (len(files_in_archive) == 1)  # Make sure there is only one text file in the archive
         event_file = zip_file.open(files_in_archive[0], 'r')
     else:
         event_file = open(args.input, 'r')
 
-    # get width and height from text file header
+    # Get width and height from text file header
     for line in event_file:
         if args.input.endswith('zip'):
             line = line.decode("utf-8")
         width, height = line.split(' ')
         width, height = int(width), int(height)
         break
-    # ignore header + the first start_index lines
+    # Ignore header + the first start_index lines
     for i in range(1):  # + range(1 + start_index) if we want to ignore more lines
         event_file.readline()
 
@@ -144,7 +146,7 @@ if __name__ == "__main__":
 
     # Set initial values
     x_k = numpy.matrix('0; 0; 0; 0')
-    P_k = numpy.matrix('10000 0 0 0; 0 10000 0 0; 0 0 10000 0; 0 0 0 10000')
+    P_k = numpy.matrix('1 0 0 0; 0 1 0 0; 0 0 1 0; 0 0 0 1')
     k = 0
     p = 0
     sim_time = 0
@@ -154,23 +156,23 @@ if __name__ == "__main__":
     last_stamp = None
     last_processing_time = None
     start_index = 0
-    z_img = numpy.matrix([[height], [width]], numpy.float32)  # start in lower right corner (for this dataset)
+    z_img = numpy.matrix([[height], [width]], numpy.float32)  # Start in lower right corner (for this dataset)
     x_k_accum = x_k[0:2,:]
     z_k_accum = x_k[0:2,:]
     time_stamp_list = numpy.matrix('0')
-    list_of_modes = numpy.matrix('1000') # ignore this value later
-
-    # Total time
+    list_of_modes = numpy.matrix('1000') # This value will be ignored later
+    z_k1 = None
+	
+    # Total time to simulate
     total_time = 15  # s
 
     # Algorithm for estimation
     while sim_time < total_time:
 
-        # MEASUREMENT ------------------------------------------------------------------------------------------------------
+        # MEASUREMENT -------------------------------------
 
         if last_processing_time is None:
-            duration = 0.1  # 100ms window to get some initial data. After this, the duration window will correspond
-                            # to the time spent processing data in the previous step
+            duration = 0.1  # 100ms window to get some initial data. After this, the duration window will correspond to the time spent processing data in the previous step
         else:
             duration = last_processing_time
 
@@ -183,7 +185,7 @@ if __name__ == "__main__":
             t, x, y, pol = float(t), int(x), int(y), int(pol)
             if last_stamp is None:
                 last_stamp = t
-            if t > last_stamp + duration: # stop adding events when time exceeds the desired time window
+            if t > last_stamp + duration: # Stop adding events when time exceeds the desired time window
                 last_stamp = t
                 event_window = numpy.array(event_list)
                 time_stamp_list = numpy.concatenate((time_stamp_list, numpy.matrix([t])), axis=0)
@@ -192,62 +194,28 @@ if __name__ == "__main__":
                 event_list.append([t, x, y, pol])
 
         # Turn events into torch tensor
-        event_tensor = events_to_voxel_grid_pytorch(event_window,
-                                                    num_bins=5,
-                                                    width=width,
-                                                    height=height,
-                                                    device=device)
+        event_tensor = events_to_voxel_grid_pytorch(event_window, num_bins=5, width=width, height=height, device=device)
 
-        # SCHEDULING POLICY -------------------------------------------------------------------------------------------------
+        # SCHEDULING POLICY -------------------------------
 
         # Decide processing method using current information (P_k), with one of the following rules:
-        # Greedy
-        if args.scheduling_method == 'greedy':
-            J_0 = numpy.trace(P_k) * processing_time_0
-            J_1 = numpy.trace(P_k) * processing_time_1
-            if J_0 < J_1:
-                mode = 0
-            else:
-                mode = 1
-
-        # Greedy2
-        if args.scheduling_method == 'greedy2':
-            # starting with mode 0
-            Jk_0 = numpy.trace(P_k) * processing_time_0
-            Lk_0 = Ad0 * P_k * H_t * numpy.linalg.inv(H * P_k * H_t + R0)
-            Pk1_0 = (Ad0 - Lk_0 * H) * P_k * numpy.transpose(Ad0) + Qd0
-            Jk_00 = numpy.trace(Pk1_0) * processing_time_0
-            Jk_01 = numpy.trace(Pk1_0) * processing_time_1
-            J_0 = min((Jk_0 + Jk_00), (Jk_0 + Jk_01))
-            # starting with mode1
-            Jk_1 = numpy.trace(P_k) * processing_time_1
-            Lk_1 = Ad1 * P_k * H_t * numpy.linalg.inv(H * P_k * H_t + R1)
-            Pk1_1 = (Ad1 - Lk_1 * H) * P_k * numpy.transpose(Ad1) + Qd1
-            Jk_10 = numpy.trace(Pk1_1) * processing_time_0
-            Jk_11 = numpy.trace(Pk1_1) * processing_time_1
-            J_1 = min((Jk_1 + Jk_10), (Jk_1 + Jk_11))
-            #choose option with minimum cost
-            if J_0 < J_1:
-                mode = 0
-            else:
-                mode = 1
 
         # Fixed length, moving horizon
         if args.scheduling_method == 'mh':
-            #Compute calendar length
+            # Compute calendar length
             l = math.ceil(args.mh_T / min(processing_time))
-            #Compute all posible schedules to cover a time interval of length mh_T
+            # Compute all posible schedules to cover a time interval of length mh_T
             schedules = list(map(list, itertools.product([0, 1], repeat=l)))
-            #For every schedule, compute attention and cost
+            # For every schedule, compute attention and cost
             cost_list = []
             for sched in schedules:
-                #attention
+                # Attention
                 sum = 0
                 for i in range(l):
                     if sum < args.mh_T:
                         att = i
                     sum = sum + processing_time[sched[i]]
-                #cost
+                # Cost
                 cost = 0
                 P = P_k
                 sum_delta_pk = 0
@@ -256,36 +224,33 @@ if __name__ == "__main__":
                     if i < att:
                         cost = cost + numpy.trace(P) * processing_time[sched[i]] + lambda_alpha * rpk[sched[i]]
                         sum_delta_pk = sum_delta_pk + processing_time[sched[i]]
-                        #compute next P
+                        # Compute next P
                         L = Ad[sched[i]] * P * H_t * numpy.linalg.inv(H * P * H_t + Rk[sched[i]])
                         P = (Ad[sched[i]] - L * H) * P * numpy.transpose(Ad[sched[i]]) + Qd[sched[i]]
                     else:
                         cost = cost + numpy.trace(P) * (args.mh_T - sum_delta_pk) + lambda_alpha * rpk[sched[i]]
                 cost_list.append(cost)
-            #check minimum cost
+            #Check minimum cost
             min_cost_index = cost_list.index(min(cost_list))
             mode = schedules[min_cost_index][0]
 
         # Fixed schedule, decided beforehand
         if args.scheduling_method == 'fixed':
-            lambda_alpha = 0.1
+            lambda_alpha = 0.05
             mode = schedule[p]
             if p < len(schedule)-1:
                 p = p + 1
             else:
                 p = 0
-            # add to the total cost value
-            if k >= 10: #ignore the first several iterations (the value of P is very high)
-                if sim_time + processing_time[mode] <= total_time:
-                    total_cost = total_cost + numpy.trace(P_k) * processing_time[mode] + lambda_alpha * rpk[mode]
-                else:
-                    total_cost = total_cost + numpy.trace(P_k) * (total_time - sim_time) + lambda_alpha * rpk[mode]
-
-        print('Chosen mode', mode)
+            # Add to the total cost value
+            if sim_time + processing_time[mode] <= total_time:
+                total_cost = total_cost + numpy.trace(P_k) * processing_time[mode] + lambda_alpha * rpk[mode]
+            else:
+                total_cost = total_cost + numpy.trace(P_k) * (total_time - sim_time) + lambda_alpha * rpk[mode]
 
         list_of_modes = numpy.concatenate((list_of_modes, numpy.matrix([[mode]])), axis = 0)
 
-        # DATA PROCESSING ---------------------------------------------------------------------------------------------------
+        # DATA PROCESSING ----------------------------------
 
         # Reconstruct image with last chosen method
         num_events_in_window = event_window.shape[0]
@@ -296,7 +261,7 @@ if __name__ == "__main__":
         # Detect person
         frame_path = os.path.join(args.output_folder, 'reconstruction/frame_{:010d}.png'.format(event_tensor_id))
         img = read_image(frame_path, format="BGR")
-        img = numpy.rot90(img) #rotate image so that the person can be detected
+        img = numpy.rot90(img) # Rotate image so that the person can be detected
         if mode == 0:
             predictions, visualized_output = detector_mode0.run_on_image(img)
         if mode == 1:
@@ -307,13 +272,14 @@ if __name__ == "__main__":
         # Compute image coordinates for the lower edge of the bounding box (frame coordinates)
         if "instances" in predictions:
             instances = predictions["instances"]
-            if len(instances.pred_boxes) >= 1: #if there are no instances, the measurement from the last iteration will be used again
+            if len(instances.pred_boxes) >= 1: # If there are no instances, the measurement from the last iteration will be used again
                 bbox = instances[0].pred_boxes.tensor.cpu().numpy()
-                bbox = bbox[0,:] #if there are more than one bbox, take only the first (class 0 = 'person')
+                bbox = bbox[0,:] # If there is more than one bbox, take only the first (class 0 = 'person')
                 zx = (bbox[0] + bbox[2]) / 2
                 zy = bbox[3]
-                z_img[0, 0] = zx.item()
-                z_img[1, 0] = zy.item()
+                if zy > 150:
+                    z_img[0, 0] = zx.item()
+                    z_img[1, 0] = zy.item()
 
         # Turn into world coordinates
         z_und = cv2.undistortPoints(z_img, K, distCoeffs, P=K)
@@ -321,7 +287,8 @@ if __name__ == "__main__":
         z_w = numpy.linalg.inv(projMatrix) * z_und
         z_k = z_w[0:2, 0] / z_w[2, 0]
 
-        # ESTIMATION --------------------------------------------------------------------------------------------------------
+
+        # ESTIMATION --------------------------------------
 
         if mode == 0:
             L_k = Ad0 * P_k * H_t * numpy.linalg.inv(H * P_k * H_t + R0)
@@ -337,19 +304,19 @@ if __name__ == "__main__":
             sim_time = sim_time + processing_time_1
             last_processing_time = processing_time_1
 
-        z_k_accum = numpy.concatenate((z_k_accum, z_k), axis=1)  # every column corresponds to an iteration
-        x_k_accum = numpy.concatenate((x_k_accum, x_k[0:2,:]), axis=1) #every column corresponds to an iteration
+        z_k_accum = numpy.concatenate((z_k_accum, z_k), axis=1)  
+        x_k_accum = numpy.concatenate((x_k_accum, x_k[0:2,:]), axis=1) # Every column corresponds to an iteration
 
         k = k + 1
 
-
-        #PLOT Z_K AND X_K OVER THE IMAGE
-        implot = plt.imshow(img)
+        #PLOT Z_K AND X_K OVER THE IMAGE ------------------
+        
+		implot = plt.imshow(img)
 
         xy = numpy.matrix([[x_k[0,:].item()], [x_k[1,:].item()], [1]], numpy.float32)
         xy_img = projMatrix * xy;
         xy_img = xy_img[0:2, :] / xy_img[2, :]
-        xy_dist = cv2.undistortPoints(xy_img, K, -distCoeffs, P=K) # approximation for small distortions
+        xy_dist = cv2.undistortPoints(xy_img, K, -distCoeffs, P=K) # Approximation for small distortions
         x = numpy.squeeze(numpy.asarray(xy_dist[0,0,0]))
         y = numpy.squeeze(numpy.asarray(xy_dist[0,0,1]))
         zx = numpy.squeeze(numpy.asarray(z_img[0, :]))
@@ -362,22 +329,23 @@ if __name__ == "__main__":
 
     # End of loop
 
-    # TRANSFER DATA TO TXT FILE
-    data = numpy.concatenate((list_of_modes, time_stamp_list, numpy.transpose(z_k_accum), numpy.transpose(x_k_accum)), axis=1)
+    # TRANSFER DATA TO TXT FILE ---------------------------
+    
+	data = numpy.concatenate((list_of_modes, time_stamp_list, numpy.transpose(z_k_accum), numpy.transpose(x_k_accum)), axis=1)
     with open(args.txt_file, 'w') as f:
         if args.scheduling_method == 'fixed':
             f.write(str(schedule) + '\n')
             f.write(str(total_cost) + '\n')
         for line in data:
             string = ''
-            for i in range(6): # write mode, timestamp, zk_x, zk_y, xk_x, xk_y
+            for i in range(6): # Write mode, timestamp, zk_x, zk_y, xk_x, xk_y
                 string = string + str(line[0,i]) + ' '
             string = string + '\n'
             f.write(string)
 
-
-    # PLOT TRAJECTORY ON THE FLOOR
-    x = x_k_accum[0,:]
+    # PLOT TRAJECTORY ON THE FLOOR ------------------------
+    
+	x = x_k_accum[0,:]
     y = x_k_accum[1,:]
     x = numpy.squeeze(numpy.asarray(x))
     y = numpy.squeeze(numpy.asarray(y))
